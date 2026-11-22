@@ -1,0 +1,16 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local config with secrets and runtime data
+config.toml
+config.json
+data/
+clips/
+
+# Local build/deploy helpers (not part of the repo, as in the polling service)
+work/
+
+# OS
+.DS_Store

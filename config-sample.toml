@@ -1,0 +1,96 @@
+# ss-webhook-telegram configuration (TOML).
+#
+# Every key in the [defaults] table below can be overridden per Action Rule
+# through the webhook body's "config" object, using the SAME key name. Example:
+#
+#   {"camera":"%DEVICE_NAME%","time":"%EVENT_TIME%","chat":"test",
+#    "config":{"burst_photos":2,"cooldown_secs":15}}
+#
+# TOML note: these scalar keys sit at the top level, so they must stay ABOVE
+# the first [table] header. Tables and [[chats]] may follow in any order.
+
+data_folder = "/data"
+ffmpeg_working_folder = "/clips"
+timezone = "GMT"             # zone used to parse %EVENT_TIME% (it carries no zone)
+log_level = "INFO"           # DEBUG | INFO | WARNING | ERROR
+processing_threads = 1       # concurrent ffmpeg passes (H.265 decode is CPU bound)
+ffmpeg_hwaccel = "auto"      # HEVC decode: "auto" (VAAPI when /dev/dri works,
+                             # otherwise software) | "vaapi" (require it) | "none"
+
+# ------------------------------------------------------------- synology
+[synology]
+base_api_url = "https://192.168.0.3:5001"
+user = "CHANGE_ME"
+password = "CHANGE_ME"
+verify_ssl = false           # NAS usually has a self-signed certificate
+timeout_connect = 10
+timeout_read = 60
+
+# ---------------------------------------------------- webhook receiver
+[webhook]
+listen = "0.0.0.0:8099"
+path = "/webhook"
+# Basic auth is optional; uncomment to require credentials in the Action Rule:
+# [webhook.auth]
+# user = "ss"
+# password = "CHANGE_ME"
+
+# ------------------------------------------------------------- telegram
+[telegram]
+# One URL, or several comma-separated. A failed send retries through the next
+# one; the URL that last worked stays active until the next failure.
+base_url = "https://teleproxy.example.com, https://teleproxy-2.example.com"
+# proxy = "socks5h://user:pass@host:port"
+connect_timeout = 20
+read_timeout = 60
+send_attempts = 3
+retry_backoff_secs = 5
+default_chat = "test"        # used when the payload has no/unknown "chat"
+
+# Named chat groups; the Action Rule body selects one by "chat" = "<name>".
+[[chats]]
+name = "test"
+tele_bot_token = "123456:CHANGE_ME"
+tele_chat_id = -1000000000000
+
+# Add more groups the same way:
+# [[chats]]
+# name = "common"
+# tele_bot_token = "123456:CHANGE_ME"
+# tele_chat_id = -1001740052035
+
+# ====================================================================
+# Defaults - ALL of these are overridable via the payload "config".
+# Key names here and in the payload are identical.
+#
+# Delivery is fixed: every episode is one album of photos and one clip, both
+# cut from the same recording fragment (there is no photo-only/video-only mode).
+# ====================================================================
+[defaults]
+
+# ---- episodes ------------------------------------------------------
+episode_gap_secs = 60         # pause that closes an episode (and opens a new one)
+cooldown_secs = 30            # min pause between follow-up photos (from the last send)
+max_photos_per_episode = 0    # 0 = no limit
+
+# ---- photos (frames of the recording) ------------------------------
+burst_photos = 3              # frames on the first event of an episode
+burst_skip_first_secs = 2.0   # first frame this long after the event: the trigger
+                              # often fires before the subject really moves
+burst_interval_secs = 1.5     # pause between the burst frames
+subsequent_photos = 1         # frames on each follow-up event (after cooldown)
+photo_max_side = 1280         # long-side limit (matches Telegram's photo cap)
+photo_quality = 2             # ffmpeg -q:v for JPEG, 2..31 (lower = better)
+use_snapshot_api = "auto"     # follow-up photo source: "auto" (try the live
+                              # snapshot API, fall back to recording key frames),
+                              # true (snapshot only, no fallback) or false
+                              # (recording key frames only). Use true for H.264
+                              # cameras that keep server-side snapshots.
+
+# ---- video clip ----------------------------------------------------
+video_skip_first_n_secs = 0   # clip starts this many seconds after the event
+video_max_length_secs = 8     # clip length
+video_max_height = 480
+video_fps = 15
+video_format = "mp4"          # mp4 | gif
+video_preset = "veryfast"     # x264 preset
