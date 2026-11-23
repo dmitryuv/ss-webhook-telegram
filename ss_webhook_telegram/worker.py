@@ -524,11 +524,14 @@ class EventWorker(threading.Thread):
                 return
 
             source = fragment["path"]
+            # The key-frame interval only sizes the *next* follow-up window, so
+            # it is measured in the background, in parallel with the clip pass
+            # and the sends. The fragment stays on disk until the end of the
+            # episode for that probe (and for the clip pass, which may still be
+            # waiting in the processing pool).
+            self._remember_gop_async(cam, source)
             clip_path, frame_paths = self._process_clip(
                 cam, settings, fragment, send_frames)
-            self._remember_gop(cam, source)
-            _unlink(source)
-            source = None
             if self._dry_run:
                 logging.info("[dry-run] would send %i photo(s) and a clip for %s",
                              len(frame_paths), label)
@@ -673,7 +676,7 @@ class EventWorker(threading.Thread):
             photo_quality=settings.photo_quality)
         self._run_ffmpeg(args, cam, fragment["episode_start"])
         frame_paths = [str(p) for p in sorted(self._workdir.glob(tag + "_*.jpg"))]
-        self._log_clip(cam, fragment, clip_path, frame_paths)
+        self._log_clip(cam, fragment, frame_paths)
         return clip_path, frame_paths
 
     def _run_ffmpeg(self, args, cam, t_ev):
@@ -696,13 +699,10 @@ class EventWorker(threading.Thread):
             logging.error("Clip %s: Telegram rejected the message", label)
             _unlink(clip_path)
 
-    def _log_clip(self, cam, fragment, clip_path, frame_paths):
-        clip_secs = media.probe_duration(clip_path)
+    def _log_clip(self, cam, fragment, frame_paths):
         extra = "lead %.0fs, snap %.1fs" % (fragment["lead"], fragment["snap"])
         if fragment["fragment"] is not None:
             extra += ", fragment %.1fs" % fragment["fragment"]
-        if clip_secs is not None:
-            extra += ", clip %.1fs" % clip_secs
         extra += ", %i frame(s)" % len(frame_paths)
         logging.info("Clip %s: %s", self._label(cam, fragment["episode_start"]), extra)
 
@@ -714,6 +714,22 @@ class EventWorker(threading.Thread):
         if not self._dry_run:
             self._store.set_gop(cam.name, gap)
         logging.info("%s: key-frame interval %.1fs", cam.name, gap)
+
+    def _remember_gop_async(self, cam, source):
+        """Run :meth:`_remember_gop` off the delivery path.
+
+        The probe is a few hundred milliseconds of ffprobe; nothing on this
+        event needs its result, so it must not sit between the clip and the
+        first Telegram message. Errors are logged and swallowed: a missing
+        measurement only keeps the previous (or the default) value.
+        """
+        def run():
+            try:
+                self._remember_gop(cam, source)
+            except Exception:
+                logging.exception("%s: key-frame probe failed", cam.name)
+
+        threading.Thread(target=run, name="gop-%s" % cam.id, daemon=True).start()
 
     def _wait(self, secs):
         """Sleep up to `secs`, honouring shutdown. True when we were stopped."""

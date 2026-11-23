@@ -240,9 +240,11 @@ time, while `%EVENT_TIME%` can be several seconds earlier.
 - **Follow-ups are key frames.** A later event of an episode has no clip to
   share a decode with, so it downloads a tiny window and decodes key frames
   only (`-skip_frame nokey`, a few times cheaper). The window is
-  `(subsequent_photos - 1) * GOP + 1s`; the interval itself is measured on the
-  last burst (the largest gap between key frames) and remembered per camera in
-  `camera_gop`, with a 4s fallback until the first episode.
+  `(subsequent_photos - 1) * GOP + 1s`; the interval itself is measured in the
+  background on the last burst (the largest gap between key frames) and
+  remembered per camera in `camera_gop`, with a 4s fallback until the first
+  episode. The measurement runs in parallel with the clip pass and the sends,
+  so it never delays the event.
 - **Or the live Snapshot API.** `use_snapshot_api` picks the follow-up source:
   `auto` tries the live snapshot (a cheap JPEG) and falls back to recording key
   frames if it fails, remembering the failure per camera in memory (a restart
@@ -279,7 +281,7 @@ time, while `%EVENT_TIME%` can be several seconds earlier.
   `video_max_height`) or `gif`.
 - **No cover frame.** Short videos autoplay in Telegram, so no cover frame is
   attached.
-- **Logs.** Every clip logs `lead Xs, snap Ys, fragment As, clip Ds, N frame(s)`,
+- **Logs.** Every clip logs `lead Xs, snap Ys, fragment As, N frame(s)`,
   which makes both the timing of the cut and the download overhead easy to
   audit.
 
@@ -503,7 +505,7 @@ What to look for in the log:
 - `New episode: <camera> (N photo(s), clip=mp4)` - an episode opened.
 - `Episode <camera>: +N photo(s) for a follow-up event` - a later event in the
   same episode.
-- `Clip <camera> @...: lead Xs, snap Ys, fragment As, clip Ds, N frame(s)` -
+- `Clip <camera> @...: lead Xs, snap Ys, fragment As, N frame(s)` -
   download and cut timing.
 - `Telegram endpoint switched to <host>` - endpoint rotation kicked in.
 - `unknown chat group 'x', using default 'y'` - the rule body and the config
