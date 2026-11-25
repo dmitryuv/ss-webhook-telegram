@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .media import DEFAULT_VIDEO_FPS, FPS_PASSTHROUGH
+
 
 class ConfigError(Exception):
     """Raised when the config file is missing, malformed or inconsistent."""
@@ -34,6 +36,7 @@ DEFAULTS_KEYS = {
     "subsequent_photos", "photo_max_side", "photo_quality",
     "video_skip_first_n_secs", "video_max_length_secs", "video_max_height",
     "video_fps", "video_format", "video_preset", "use_snapshot_api",
+    "recording_stream",
 }
 SYNOLOGY_KEYS = {"base_api_url", "user", "password", "verify_ssl",
                  "timeout_connect", "timeout_read"}
@@ -103,10 +106,11 @@ class Config:
     video_skip_first_n_secs: float
     video_max_length_secs: float
     video_max_height: int
-    video_fps: int
+    video_fps: int | str
     video_format: str
     video_preset: str
     use_snapshot_api: str
+    recording_stream: str
 
     def chat(self, name):
         """Chat group by name, falling back to default_chat, or None."""
@@ -190,6 +194,13 @@ def _choice(raw, key, default, allowed):
         raise ConfigError("%s: expected one of %s, got %r"
                           % (key, ", ".join(sorted(allowed)), raw))
     return value
+
+
+def _video_fps(raw, key, default=DEFAULT_VIDEO_FPS):
+    """A positive frame rate, or "pass" to keep the recording's timestamps."""
+    if isinstance(raw, str) and raw.strip().lower() == FPS_PASSTHROUGH:
+        return FPS_PASSTHROUGH
+    return _integer(raw, key, default, positive=True)
 
 
 def _snapshot_mode(raw, key, default="auto"):
@@ -314,6 +325,14 @@ def load(path) -> Config:
     burst_interval = _number(defaults.get("burst_interval_secs"),
                              "defaults.burst_interval_secs", 1.5, positive=True)
 
+    video_format = _choice(defaults.get("video_format"), "defaults.video_format",
+                           "mp4", FORMATS)
+    video_fps = _video_fps(defaults.get("video_fps"), "defaults.video_fps")
+    if video_format == "gif" and video_fps == FPS_PASSTHROUGH:
+        raise ConfigError("defaults.video_fps: 'pass' keeps the recording's own "
+                          "timestamps and cannot be used with video_format = "
+                          "'gif'; set a frame rate instead")
+
     return Config(
         data_folder=str(raw.get("data_folder") or "/data"),
         ffmpeg_working_folder=str(raw.get("ffmpeg_working_folder") or "/clips"),
@@ -366,9 +385,12 @@ def load(path) -> Config:
                                       "defaults.video_max_length_secs", 8, positive=True),
         video_max_height=_integer(defaults.get("video_max_height"), "defaults.video_max_height",
                                   480, positive=True),
-        video_fps=_integer(defaults.get("video_fps"), "defaults.video_fps", 15, positive=True),
-        video_format=_choice(defaults.get("video_format"), "defaults.video_format", "mp4", FORMATS),
+        video_fps=video_fps,
+        video_format=video_format,
         video_preset=str(defaults.get("video_preset") or "veryfast"),
         use_snapshot_api=_snapshot_mode(defaults.get("use_snapshot_api"),
                                         "defaults.use_snapshot_api", "auto"),
+        recording_stream=_choice(defaults.get("recording_stream"),
+                                 "defaults.recording_stream", "auto",
+                                 {"auto", "main", "dual"}),
     )

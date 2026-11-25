@@ -13,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import media, telegram, webhook
+from . import __version__
 from .config import ConfigError, load
 from .store import EventStore
 from .synology import SynologyError, SurveillanceClient
@@ -144,9 +145,14 @@ def _log_config(config):
                  "(burst frames come from the recording)",
                  config.photo_max_side, config.photo_quality,
                  config.use_snapshot_api)
-    logging.info("Video: start=+%.1fs length=%.1fs max_height=%ip fps=%i format=%s",
+    logging.info("Recording stream: %s (auto picks the lightest stream that "
+                 "covers photo_max_side and video_max_height)",
+                 config.recording_stream)
+    logging.info("Video: start=+%.1fs length=%.1fs max_height=%ip fps=%s format=%s",
                  config.video_skip_first_n_secs, config.video_max_length_secs,
-                 config.video_max_height, config.video_fps, config.video_format)
+                 config.video_max_height,
+                 "pass (source timestamps)" if config.video_fps == media.FPS_PASSTHROUGH
+                 else config.video_fps, config.video_format)
     logging.info("Concurrency: camera queues, %i processing thread(s), "
                  "%i telegram senders", config.processing_threads,
                  telegram.SEND_WORKERS)
@@ -177,7 +183,8 @@ def main(argv=None):
         from urllib3.exceptions import InsecureRequestWarning
         urllib3.disable_warnings(InsecureRequestWarning)
 
-    logging.info("Starting (%s mode)", "dry-run" if args.dry_run else "normal")
+    logging.info("Starting (%s mode), version %s",
+                 "dry-run" if args.dry_run else "normal", __version__)
     _log_config(config)
 
     client = SurveillanceClient(

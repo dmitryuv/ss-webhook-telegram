@@ -86,11 +86,20 @@ use_snapshot_api = "auto"     # follow-up photo source: "auto" (try the live
                               # true (snapshot only, no fallback) or false
                               # (recording key frames only). Use true for H.264
                               # cameras that keep server-side snapshots.
+recording_stream = "auto"     # which recording list feeds clips and photos:
+                              # "main" (event recordings of the main stream, the
+                              # historical behaviour), "dual" (low-profile chunks
+                              # of the continuous recording, if the camera writes
+                              # them) or "auto" (the lightest stream that still
+                              # covers photo_max_side and video_max_height).
+                              # "main" is the rollback switch: it changes nothing
+                              # in code, only which list is read.
 
 # ---- video clip ----------------------------------------------------
 video_skip_first_n_secs = 0   # clip starts this many seconds after the event
 video_max_length_secs = 8     # clip length
 video_max_height = 480
-video_fps = 15
-video_format = "mp4"          # mp4 | gif
+video_fps = 15                # 15, 20, ... or "pass": keep the recording's
+                              # own timestamps (no fps filter, VFR output)
+video_format = "mp4"          # mp4 | gif ("pass" is mp4 only)
 video_preset = "veryfast"     # x264 preset

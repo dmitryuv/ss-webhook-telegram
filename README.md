@@ -49,10 +49,12 @@ single trimmed clip, delivered as ordinary Telegram messages.
   `episode_gap_secs` belong to one episode: a burst on the first event, sparse
   follow-ups with a cooldown, and exactly one video clip.
 - **Photos are frames of the recording.** One download and one ffmpeg pass
-  produce both the clip and the photo frames, so a burst costs no extra decode.
-  Nothing depends on Surveillance Station snapshots, so the service keeps
-  working for H.265 as well, where the station drops server-side processing
-  from DSM 7.2.2 on.
+  produce both the clip and the burst frames, so a burst costs no extra decode.
+  A follow-up frame is a single `SnapShot/Take?time=` request for the event
+  second, with the recording key frames as its fallback, so no photo needs a
+  decode of its own either. The burst and the clip do not depend on
+  Surveillance Station snapshots, so they keep working for H.265 as well, where
+  the station drops server-side processing from DSM 7.2.2 on.
 - **Hardware decoding, picked automatically.** The image ships both Intel VAAPI
   drivers, `iHD` and `i965`, and probes them in that order at startup: modern
   kernels get `iHD`, the older Synology kernels where `iHD` cannot initialise
@@ -70,6 +72,17 @@ single trimmed clip, delivered as ordinary Telegram messages.
   actually was from the fragment duration, and cuts with an exact `ffmpeg -ss`,
   so the clip begins at `event time + video_skip_first_n_secs` - also when a new
   episode starts inside a recording that has been open for minutes.
+- **Chunk boundaries are stitched.** Surveillance Station splits a continuous
+  recording into chunks of `recordTime` (30 minutes by default) and
+  `Recording.Download` never crosses that boundary: a request that starts near
+  the end of a chunk comes back truncated. The service plans the window as
+  consecutive chunks and joins them with `concat`, so an event that lands on a
+  boundary is delivered whole instead of being lost.
+- **The lightest recording stream wins.** `recording_stream` picks, per camera,
+  the event recordings of the main stream (`main`, the behaviour of earlier
+  versions) or the low profile chunks of the continuous dual recording
+  (`dual`), which are written around the clock and are two to four times
+  lighter; `auto` (the default) decides from bitrate and resolution.
 - **No reliance on the recording index.** `Recording.List` lags several seconds
   behind the writer; readiness is decided by wall clock plus a length check of
   the downloaded fragment, so the clip is fetched as early as it exists.
@@ -142,8 +155,10 @@ single trimmed clip, delivered as ordinary Telegram messages.
    config is visible immediately:
 
    ```
+   Starting (normal mode), version 0.15.0-build001
    Config: timezone=GMT burst=3@1.5s skip=2.0s subsequent=1 cooldown=30s gap=60s
    Photos: max_side=1280px quality=2 snapshot_api=auto (burst frames come from the recording)
+   Recording stream: auto (auto picks the lightest stream that covers photo_max_side and video_max_height)
    Video: start=+0.0s length=8.0s max_height=480p fps=15 format=mp4
    FFmpeg: decode=vaapi (iHD, /dev/dri/renderD128), encode=libx264
    Concurrency: camera queues, 1 processing thread(s), 3 telegram senders
@@ -189,8 +204,8 @@ NAS registry.
 5. **Recording window.** The first event of an episode downloads one recording
    window starting at the event; a single ffmpeg pass on the processing pool
    turns it into the photo burst and the clip. Later events send at most
-   `subsequent_photos` key frames from a tiny window, never faster than
-   `cooldown_secs`.
+   `subsequent_photos` frames taken by exact time from the recording, never
+   faster than `cooldown_secs`.
 6. **Send.** The burst goes as one album, then the clip follows immediately,
    both through a small send queue with retries, so a slow or stuck upload does
    not block the rest of the pipeline.
@@ -225,6 +240,42 @@ To see the station's own view, export **Action Rule History** (SS -> Log) and
 compare it with the service log: the rule's execution time matches our `handled`
 time, while `%EVENT_TIME%` can be several seconds earlier.
 
+## Recording source
+
+Clips and follow-up frames are cut from the camera's own recording. Which
+recording list feeds them is `recording_stream`:
+
+- `main` - the event recordings of the main stream, i.e. what the camera wrote
+  because something moved, with holes between them. This is the behaviour of
+  earlier versions and the rollback switch: a config line plus a restart, no
+  rebuild.
+- `dual` - the low-profile chunks of the continuous (dual) recording, when the
+  camera writes one.
+- `auto` - both lists, picking the lightest stream that still covers
+  `photo_max_side` without upscaling and `video_max_height`. On a camera with a
+  continuous dual recording that is the low-profile stream: it is written
+  around the clock (no holes between events) and is two to four times lighter
+  than the main one, so downloads and decodes both shrink.
+
+The choice is made on the first event of a camera: startup is not delayed and
+does not query cameras that never fire. It is cached in memory and
+re-evaluated when a download gives up. A camera without dual chunks stays on
+`main`; one whose stream is smaller than `photo_max_side` (a 4CIF camera) keeps
+working with a warning instead of losing events.
+
+### Chunk boundaries
+
+Surveillance Station cuts every continuous recording into chunks of
+`recordTime` (1800 s / 30 min by default) and `Recording.Download` never
+crosses that boundary: a request that starts near the end of a chunk comes back
+truncated. The service therefore plans the window as consecutive pieces,
+downloads each one and stitches them with `concat`, so an event that lands on a
+chunk boundary is delivered whole. A hole larger than 0.5 s between chunks is a
+real gap (retention, a camera restart): the clip is cut from what exists
+instead of retrying material that will never appear, and a follow-up photo in
+such a hole is skipped. A follow-up photo otherwise keeps the first chunk,
+because its window is a couple of seconds and the event is always in it.
+
 ## Photo pipeline
 
 - **Source is the recording.** The burst frames are cut from the same fragment
@@ -237,20 +288,30 @@ time, while `%EVENT_TIME%` can be several seconds earlier.
   `event + burst_skip_first_secs + i * burst_interval_secs`: real moments of the
   recording, not key frames. If the burst window reaches past the clip, the
   download simply covers the longer of the two.
-- **Follow-ups are key frames.** A later event of an episode has no clip to
-  share a decode with, so it downloads a tiny window and decodes key frames
-  only (`-skip_frame nokey`, a few times cheaper). The window is
-  `(subsequent_photos - 1) * GOP + 1s`; the interval itself is measured in the
+- **Follow-ups are recorded frames at the event time.** A later event of an
+  episode has no clip to share a decode with, so its photo is one frame of the
+  recording taken by exact time (`SnapShot/Take?time=`): SS returns the frame
+  of the recorded snapshot stream at that second, so the photo shows the event
+  itself. A *live* snapshot would be the camera's latest key frame instead, up
+  to a whole GOP before the event, where the motion may not have started yet.
+  The frame is fetched in a single request and then scaled like any other
+  photo.
+- **Or recording key frames.** `use_snapshot_api` picks the follow-up source:
+  `auto` tries the snapshot and falls back to the camera key frames of a tiny
+  recording window if it fails, `true` uses snapshots only and logs an error
+  instead of falling back, `false` uses recording frames only. One unlucky
+  second is cheap: SS answers 400 for a second the recording index has not
+  caught up with yet, so a failed photo is retried a few times and counts once,
+  and the camera switches to recording frames only after five failed events in
+  a row - the first frame clears the run. A 400 for a second inside a real
+  recording hole falls back at once. There is no timer: the switch is dropped
+  when the camera list is re-read or the process restarts, so a host that
+  cannot serve a frame by time is not asked again. The key-frame window is
+  `(subsequent_photos - 1) * GOP + 1s`, and the GOP itself is measured in the
   background on the last burst (the largest gap between key frames) and
   remembered per camera in `camera_gop`, with a 4s fallback until the first
-  episode. The measurement runs in parallel with the clip pass and the sends,
-  so it never delays the event.
-- **Or the live Snapshot API.** `use_snapshot_api` picks the follow-up source:
-  `auto` tries the live snapshot (a cheap JPEG) and falls back to recording key
-  frames if it fails, remembering the failure per camera in memory (a restart
-  re-evaluates, e.g. after a codec change); `true` uses snapshots only and logs
-  an error instead of falling back; `false` uses recording frames only. The
-  burst always comes from the recording (it shares the clip's decode).
+  episode. The burst always comes from the recording (it shares the clip's
+  decode).
 - **Size.** Photos are scaled to fit `photo_max_side` on the long side
   (default 1280, the same box Telegram recompresses to) and encoded with
   `-q:v photo_quality`. Note that for `-q:v` **lower is better** (2 = best,
@@ -277,13 +338,28 @@ time, while `%EVENT_TIME%` can be several seconds earlier.
   is written. So the first attempt waits for `event + window + 1s` (wall clock),
   and after downloading the service measures the fragment and retries after
   exactly the missing time if it is short. A missing recording retries after 1s.
+  A body that ends a few bytes short of its `Content-Length` (SS does that on
+  some fragments) is kept rather than discarded: the duration check decides
+  whether the fragment is usable.
 - **Format.** `mp4` (H.264, `video_preset`, `video_fps`,
   `video_max_height`) or `gif`.
+- **Frame rate.** `video_fps = 15` re-times the clip to a constant 15 fps. On a
+  stream with an uneven cadence that is visible: a 20 fps grid with every
+  fourth frame missing averages 15 fps, and the `fps` filter then shows one
+  frame twice and skips another, so the motion holds and jumps even though the
+  recording is fine. `video_fps = "pass"` keeps the recording's own timestamps
+  (no `fps` filter, `-fps_mode passthrough`): the clip then plays exactly like
+  the source, whatever its cadence, at the cost of a variable frame rate.
+  `pass` is not available with `video_format = "gif"`.
 - **No cover frame.** Short videos autoplay in Telegram, so no cover frame is
   attached.
-- **Logs.** Every clip logs `lead Xs, snap Ys, fragment As, N frame(s)`,
-  which makes both the timing of the cut and the download overhead easy to
-  audit.
+- **Logs.** Every clip logs `lead Xs, snap Ys, fragment As, N frame(s)`, plus
+  `segments 2 (4.0s + 4.0s, rec 138823 -> 138832)` when the window was
+  stitched, which makes both the timing of the cut and the download overhead
+  easy to audit. `fps=pass` is added when the clip did not use the global
+  `video_fps` (a per-rule override leaves no other trace). A fragment that is
+  still being written logs `segment 0 not written yet (rec 138823, need 9.0s,
+  got 4.8s); retry 1/8`.
 
 ## Delivery
 
@@ -398,14 +474,15 @@ Every key below can be overridden per Action Rule through the webhook body's
 | `burst_photos` | `3` | Frames on the first event of an episode |
 | `burst_skip_first_secs` | `2.0` | Delay before the first frame (the rule often fires before the subject moves) |
 | `burst_interval_secs` | `1.5` | Pause between the burst frames |
-| `subsequent_photos` | `1` | Key frames on each follow-up event (after the cooldown) |
+| `subsequent_photos` | `1` | Frames on each follow-up event (after the cooldown) |
 | `photo_max_side` | `1280` | Long-side limit in pixels (matches Telegram's photo cap) |
 | `photo_quality` | `2` | JPEG `-q:v`, 2..31 - **lower is better** |
-| `use_snapshot_api` | `auto` | Follow-up source: `auto` (snapshot, fall back to frames) \| `true` (snapshot only) \| `false` (frames only) |
+| `use_snapshot_api` | `auto` | Follow-up source: `auto` (recorded frame, fall back to key frames) \| `true` (recorded frame only) \| `false` (key frames only) |
+| `recording_stream` | `auto` | Which recording list feeds clips and photos: `main` (event recordings, the rollback switch) \| `dual` (continuous low-profile chunks) \| `auto` (the lightest stream that covers `photo_max_side` and `video_max_height`) |
 | `video_skip_first_n_secs` | `0` | Clip start, seconds after the event |
 | `video_max_length_secs` | `8` | Clip length |
 | `video_max_height` | `480` | Output height (rounded to an even number) |
-| `video_fps` | `15` | Output frame rate |
+| `video_fps` | `15` | Output frame rate, or `pass` to keep the recording's own timestamps (no re-timing; see "Frame rate") |
 | `video_format` | `mp4` | `mp4` \| `gif` |
 | `video_preset` | `veryfast` | x264 preset |
 
@@ -429,7 +506,9 @@ The Action Rule body may carry a `config` object whose keys are exactly the
 ```
 
 Invalid or unknown values are ignored with a warning in the log; for
-`video_format` the global default is used.
+`video_format` the global default is used. This is also how `video_fps` is set
+for one camera only: put `"video_fps": "pass"` in that rule's `config` and
+leave the global default at `15`.
 
 ## Webhook payload contract
 
@@ -505,6 +584,8 @@ What to look for in the log:
 - `New episode: <camera> (N photo(s), clip=mp4)` - an episode opened.
 - `Episode <camera>: +N photo(s) for a follow-up event` - a later event in the
   same episode.
+- `follow-up snapshot @HH:MM:SS (N KB)` - the recorded frame taken for a
+  follow-up, with the time it was taken at.
 - `Clip <camera> @...: lead Xs, snap Ys, fragment As, N frame(s)` -
   download and cut timing.
 - `Telegram endpoint switched to <host>` - endpoint rotation kicked in.

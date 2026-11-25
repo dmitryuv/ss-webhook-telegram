@@ -20,6 +20,10 @@ import subprocess
 
 DEFAULT_VIDEO_MAX_HEIGHT = 480
 DEFAULT_VIDEO_PRESET = "veryfast"
+DEFAULT_VIDEO_FPS = 15
+# video_fps value that keeps the recording's own timestamps instead of forcing
+# a constant frame rate.
+FPS_PASSTHROUGH = "pass"
 DEFAULT_PHOTO_MAX_SIDE = 1280
 DEFAULT_PHOTO_QUALITY = 2
 X264_PRESETS = {"ultrafast", "superfast", "veryfast", "faster", "fast",
@@ -198,9 +202,17 @@ def _photo_fit(max_side):
 
 
 def _video_branch(height, fps, skip_secs):
-    """Clip branch: start `skip_secs` after the event, CFR, 480p, yuv420p."""
-    return "trim=start={},setpts=PTS-STARTPTS,fps={},{},format=yuv420p".format(
-        skip_secs, fps, _video_scale(height))
+    """Clip branch: start `skip_secs` after the event, 480p, yuv420p.
+
+    `fps` is a number for a constant frame rate, or FPS_PASSTHROUGH to keep the
+    recording's own timestamps. Forcing CFR on a stream whose cadence is uneven
+    is not harmless: a 20 fps grid with every fourth frame missing averages
+    15 fps, and ``fps=15`` then shows one frame twice and skips another, so the
+    motion holds and jumps even though the recording is fine.
+    """
+    rate = "" if fps == FPS_PASSTHROUGH else ",fps={}".format(fps)
+    return "trim=start={},setpts=PTS-STARTPTS{},{},format=yuv420p".format(
+        skip_secs, rate, _video_scale(height))
 
 
 def _frames_branch(interval_secs, skip_secs, max_side):
@@ -216,7 +228,29 @@ def _frames_branch(interval_secs, skip_secs, max_side):
     return "select='{}',{}".format(expr, _photo_fit(max_side))
 
 
-def build_clip_args(input_path, output_path, *, seek_secs, video_skip_secs,
+def _stitch_chain(segments, video_branch, frames_branch=None):
+    """filter_complex that joins the pieces, then splits into clip + photos.
+
+    Each input is trimmed to `keep` and its PTS reset, so the stitched
+    timeline starts at the event and the skipped tail padding of every
+    fragment (Surveillance Station appends ~1 s to both ends) never shifts it.
+    """
+    parts = []
+    labels = []
+    for index, (_path, _seek, keep) in enumerate(segments):
+        parts.append("[%i:v]trim=duration=%.3f,setpts=PTS-STARTPTS[v%i]"
+                     % (index, keep, index))
+        labels.append("[v%i]" % index)
+    parts.append("%sconcat=n=%i:v=1:a=0[c]" % ("".join(labels), len(segments)))
+    if frames_branch:
+        parts.append("[c]split=2[x][y];[x]%s[vo];[y]%s[po]"
+                     % (video_branch, frames_branch))
+    else:
+        parts.append("[c]%s[vo]" % video_branch)
+    return ";".join(parts)
+
+
+def build_clip_args(segments, output_path, *, video_skip_secs,
                     video_length_secs, video_max_height, video_fps,
                     video_preset, video_format, frames_pattern=None,
                     burst_skip_secs=0.0, burst_interval_secs=1.5,
@@ -224,32 +258,58 @@ def build_clip_args(input_path, output_path, *, seek_secs, video_skip_secs,
                     photo_quality=DEFAULT_PHOTO_QUALITY):
     """One ffmpeg invocation: the clip, plus (optionally) the photo frames.
 
-    ``seek_secs`` positions the input at the event; the clip and the frames are
-    then trimmed relative to it. When ``frames_pattern`` is set, a ``split``
-    feeds two filter chains, so the input is decoded only once.
+    ``segments`` is a list of ``(path, seek_secs, keep_secs)`` in timeline
+    order. One segment is the normal case and produces exactly the historical
+    arguments; two or more are stitched with ``concat`` when the window crosses
+    a chunk boundary (Recording.Download stops at the end of a chunk, so an
+    event near a seam needs material from the next one).
+
+    ``seek_secs`` of the first segment positions the input at the event; the
+    clip and the frames are then trimmed relative to it. When
+    ``frames_pattern`` is set, a ``split`` feeds two filter chains, so the
+    input is decoded only once.
     """
     height = normalize_height(video_max_height)
     preset = normalize_preset(video_preset)
+    if video_format == "gif" and video_fps == FPS_PASSTHROUGH:
+        # GIF has no way to carry the source timestamps; the config and the
+        # per-rule overrides refuse the pair, this is the last line of defence.
+        logging.warning("video_fps=pass is not available for gif; using %i fps",
+                        DEFAULT_VIDEO_FPS)
+        video_fps = DEFAULT_VIDEO_FPS
     video_branch = _video_branch(height, video_fps, video_skip_secs)
     want_frames = bool(frames_pattern) and burst_photos and burst_photos > 0
-
+    frames_branch = None
     if want_frames:
         frames_branch = _frames_branch(normalize_interval(burst_interval_secs),
                                        burst_skip_secs,
                                        normalize_side(photo_max_side))
-        filter_complex = "[0:v]split=2[v][p];[v]%s[vo];[p]%s[po]" % (
-            video_branch, frames_branch)
-    else:
-        filter_complex = "[0:v]%s[vo]" % video_branch
 
-    args = [
-        "ffmpeg", "-loglevel", "warning", "-y",
-    ] + _hwaccel_input_args() + [
-        "-ss", str(seek_secs),
-        "-i", str(input_path),
-        "-filter_complex", filter_complex,
-        "-map", "[vo]", "-t", str(video_length_secs),
-    ]
+    args = ["ffmpeg", "-loglevel", "warning", "-y"]
+    if len(segments) == 1:
+        path, seek, _keep = segments[0]
+        if frames_branch:
+            filter_complex = "[0:v]split=2[v][p];[v]%s[vo];[p]%s[po]" % (
+                video_branch, frames_branch)
+        else:
+            filter_complex = "[0:v]%s[vo]" % video_branch
+        args += _hwaccel_input_args() + [
+            "-ss", str(seek),
+            "-i", str(path),
+            "-filter_complex", filter_complex,
+            "-map", "[vo]", "-t", str(video_length_secs),
+        ]
+    else:
+        for path, seek, _keep in segments:
+            args += _hwaccel_input_args() + ["-ss", str(seek), "-i", str(path)]
+        args += [
+            "-filter_complex", _stitch_chain(segments, video_branch, frames_branch),
+            "-map", "[vo]", "-t", str(video_length_secs),
+        ]
+    if video_fps == FPS_PASSTHROUGH:
+        # No fps filter above, so the encoder keeps the source timestamps; say
+        # it explicitly, otherwise the muxer rounds them to a constant grid.
+        args += ["-fps_mode", "passthrough"]
     if video_format == "gif":
         args += ["-f", "gif", "-loop", "0", str(output_path)]
     else:
@@ -399,6 +459,28 @@ def convert(args):
         raise MediaError("ffmpeg exited with code %i\n%s" % (result.returncode, tail))
     if result.stderr:
         logging.debug("ffmpeg stderr: %s", result.stderr.strip())
+
+
+def probe_size(path):
+    """(width, height) of the first video stream, or None if unreadable."""
+    args = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True,
+                                timeout=PROBE_TIMEOUT_SECS)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logging.warning("ffprobe size failed for %s: %s", path, e)
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        parts = [p.strip() for p in line.strip().strip(",").split(",")]
+        if len(parts) >= 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+    return None
 
 
 def probe_duration(path):
